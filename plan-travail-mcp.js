@@ -49,6 +49,21 @@ function tools() {
       inputSchema: { type:'object', properties:{ text:{type:'string'}}, required:['text'], additionalProperties:false }
     },
     {
+      name: 'plan_virtual_keyboard',
+      description: "Clavier virtuel interne de Plan Travail. Permet à ChatGPT d'écrire du texte dans une destination de l'application sans dépendre d'un outil spécialisé. target=lexicon ajoute le texte au lexique; target=street marque la rue saisie. Attend toujours la confirmation Android.",
+      inputSchema: {
+        type:'object',
+        properties:{
+          target:{type:'string',enum:['lexicon','street'],description:'Destination du texte.'},
+          text:{type:'string',description:'Texte à saisir.'},
+          details:{type:'string',description:'Détails optionnels pour le lexique.'},
+          date:{type:'string',description:'Date YYYY-MM-DD pour une rue; aujourd’hui si absente.'}
+        },
+        required:['target','text'],
+        additionalProperties:false
+      }
+    },
+    {
       name: 'plan_reset_week',
       description: "Remet à zéro tous les traçages et compteurs de la semaine en cours dans l'application. Le lexique est conservé. Attend la confirmation Android.",
       inputSchema: { type:'object', properties:{}, additionalProperties:false }
@@ -132,6 +147,20 @@ async function executeTool(name, args = {}) {
     if (!text) throw new Error('Texte du lexique manquant');
     return queuedWrite('add_lexicon', { title:text, details:text }, `Note « ${text} » ajoutée et confirmée dans le lexique Android.`);
   }
+  if (name === 'plan_virtual_keyboard') {
+    const target = String(args.target||'').trim();
+    const text = String(args.text||'').trim();
+    if (!text) throw new Error('Texte à saisir manquant');
+    if (target === 'lexicon') {
+      const details = String(args.details||text).trim() || text;
+      return queuedWrite('add_lexicon', { title:text, details }, `Clavier MCP : « ${text} » écrit et confirmé dans le lexique Android.`);
+    }
+    if (target === 'street') {
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date||'')) ? String(args.date) : new Date().toISOString().slice(0,10);
+      return queuedWrite('mark_streets', { streets:[text], date }, `Clavier MCP : rue « ${text} » marquée et confirmée dans Android.`);
+    }
+    throw new Error('Destination clavier non supportée');
+  }
   if (name === 'plan_reset_week') {
     return queuedWrite('reset_week', {}, 'Remise à zéro de la semaine confirmée par l’application Android. Le lexique est conservé.');
   }
@@ -164,7 +193,7 @@ async function executeTool(name, args = {}) {
 async function handleRpc(body) {
   const id = body && Object.prototype.hasOwnProperty.call(body,'id') ? body.id : null;
   const method = body?.method;
-  if (method === 'initialize') return rpcResult(id,{protocolVersion:'2025-06-18',capabilities:{tools:{listChanged:true}},serverInfo:{name:'Plan Travail Orsay',version:'1.2.0'}});
+  if (method === 'initialize') return rpcResult(id,{protocolVersion:'2025-06-18',capabilities:{tools:{listChanged:true}},serverInfo:{name:'Plan Travail Orsay',version:'1.3.0'}});
   if (method === 'ping') return rpcResult(id,{});
   if (method === 'tools/list') return rpcResult(id,{tools:tools()});
   if (method === 'tools/call') {
@@ -176,7 +205,7 @@ async function handleRpc(body) {
 }
 
 export function installPlanTravailMcp(app) {
-  app.get('/plan-travail/health', (_req,res)=>res.json({ok:true,service:'plan-travail-orsay-mcp',version:'1.2.0'}));
+  app.get('/plan-travail/health', (_req,res)=>res.json({ok:true,service:'plan-travail-orsay-mcp',version:'1.3.0'}));
 
   app.post('/plan-travail/mcp', async (req,res)=>{
     const answer = await handleRpc(req.body);
