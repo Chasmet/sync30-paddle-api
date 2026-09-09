@@ -1,4 +1,6 @@
 const queues = new Map();
+const commandResults = new Map();
+const deviceStates = new Map();
 const DEVICE_ID = 'orsay-main';
 
 function queueFor(id = DEVICE_ID) {
@@ -6,107 +8,197 @@ function queueFor(id = DEVICE_ID) {
   return queues.get(id);
 }
 
-function rpcResult(id, result) {
-  return { jsonrpc: '2.0', id, result };
-}
+function rpcResult(id, result) { return { jsonrpc: '2.0', id, result }; }
+function rpcError(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function newId() { return `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
 
-function rpcError(id, code, message) {
-  return { jsonrpc: '2.0', id, error: { code, message } };
+function stateFor(id = DEVICE_ID) {
+  return deviceStates.get(id) || {
+    device_id: id,
+    online: false,
+    updated_at: null,
+    current_week_count: 0,
+    today_count: 0,
+    current_week_entries: [],
+    today_streets: [],
+    lexicon: []
+  };
 }
 
 function tools() {
   return [
     {
       name: 'plan_mark_streets',
-      description: "Marque une ou plusieurs rues d'Orsay comme effectuées. L'application Android applique ensuite la couleur correspondant au jour.",
-      inputSchema: {
-        type: 'object',
-        properties: {
-          streets: { type: 'array', items: { type: 'string' }, minItems: 1 },
-          date: { type: 'string', description: 'Date YYYY-MM-DD, aujourd’hui si absente.' }
-        },
-        required: ['streets'],
-        additionalProperties: false
-      }
+      description: "Marque une ou plusieurs rues d'Orsay dans l'application puis attend l'accusé de réception Android avant de répondre.",
+      inputSchema: { type:'object', properties:{ streets:{type:'array',items:{type:'string'},minItems:1}, date:{type:'string',description:'Date YYYY-MM-DD, aujourd’hui si absente.'}}, required:['streets'], additionalProperties:false }
+    },
+    {
+      name: 'plan_delete_street',
+      description: "Supprime le traçage d'une rue de la semaine en cours dans l'application et attend la confirmation Android.",
+      inputSchema: { type:'object', properties:{ street:{type:'string'}}, required:['street'], additionalProperties:false }
+    },
+    {
+      name: 'plan_add_lexicon',
+      description: "Ajoute une entrée au lexique de l'application et attend la confirmation Android.",
+      inputSchema: { type:'object', properties:{ title:{type:'string'}, details:{type:'string'}}, required:['title','details'], additionalProperties:false }
+    },
+    {
+      name: 'plan_get_app_state',
+      description: "Lit l'état réellement renvoyé par l'application Android : rues tracées, dates, couleurs, sources, rues du jour et lexique.",
+      inputSchema: { type:'object', properties:{}, additionalProperties:false }
     },
     {
       name: 'plan_get_status',
-      description: 'Retourne le nombre de commandes Plan Travail Orsay en attente pour le téléphone.',
-      inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+      description: 'Retourne les commandes en attente, la dernière synchronisation Android et les compteurs réellement confirmés.',
+      inputSchema: { type:'object', properties:{}, additionalProperties:false }
+    },
+    {
+      name: 'plan_get_lexicon',
+      description: "Retourne le lexique réellement synchronisé depuis l'application Android.",
+      inputSchema: { type:'object', properties:{}, additionalProperties:false }
     },
     {
       name: 'plan_clear_pending',
-      description: 'Supprime les commandes Plan Travail Orsay encore en attente.',
-      inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+      description: 'Supprime uniquement les commandes encore en attente, sans modifier les données déjà appliquées dans Android.',
+      inputSchema: { type:'object', properties:{}, additionalProperties:false }
     }
   ];
 }
 
-function executeTool(name, args = {}) {
-  if (name === 'plan_mark_streets') {
-    const streets = Array.isArray(args.streets) ? args.streets.map(v => String(v).trim()).filter(Boolean) : [];
-    if (!streets.length) throw new Error('Aucune rue fournie');
-    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date || '')) ? String(args.date) : new Date().toISOString().slice(0, 10);
-    const command = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, streets, date, created_at: new Date().toISOString() };
-    queueFor().push(command);
+function enqueue(action, payload) {
+  const command = { id:newId(), action, ...payload, created_at:new Date().toISOString(), delivered_at:null };
+  queueFor().push(command);
+  return command;
+}
+
+async function waitForResult(commandId, timeoutMs = 15000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if (commandResults.has(commandId)) return commandResults.get(commandId);
+    await sleep(350);
+  }
+  return null;
+}
+
+async function queuedWrite(action, payload, successText) {
+  const command = enqueue(action, payload);
+  const ack = await waitForResult(command.id);
+  if (!ack) {
     return {
-      content: [{ type: 'text', text: `${streets.length} rue(s) envoyée(s) à Plan Travail Orsay pour le ${date}.` }],
-      structuredContent: { queued: true, device_id: DEVICE_ID, command }
+      isError: true,
+      content: [{ type:'text', text:`Commande envoyée mais l'application Android n'a pas encore confirmé son exécution. ID ${command.id}.` }],
+      structuredContent: { queued:true, confirmed:false, device_id:DEVICE_ID, command }
     };
+  }
+  const state = stateFor(DEVICE_ID);
+  return {
+    isError: !ack.success,
+    content: [{ type:'text', text: ack.success ? successText : `Échec Android : ${ack.error || 'erreur inconnue'}` }],
+    structuredContent: { queued:true, confirmed:!!ack.success, command_id:command.id, android_result:ack, app_state:state }
+  };
+}
+
+async function executeTool(name, args = {}) {
+  if (name === 'plan_mark_streets') {
+    const streets = Array.isArray(args.streets) ? args.streets.map(v=>String(v).trim()).filter(Boolean) : [];
+    if (!streets.length) throw new Error('Aucune rue fournie');
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date||'')) ? String(args.date) : new Date().toISOString().slice(0,10);
+    return queuedWrite('mark_streets', { streets, date }, `${streets.length} rue(s) confirmée(s) comme appliquée(s) dans Plan Travail Orsay.`);
+  }
+  if (name === 'plan_delete_street') {
+    const street = String(args.street||'').trim();
+    if (!street) throw new Error('Rue manquante');
+    return queuedWrite('delete_street', { street }, `Suppression de ${street} confirmée par l'application Android.`);
+  }
+  if (name === 'plan_add_lexicon') {
+    const title = String(args.title||'').trim();
+    const details = String(args.details||'').trim();
+    if (!title || !details) throw new Error('Titre et détails obligatoires');
+    return queuedWrite('add_lexicon', { title, details }, `Entrée « ${title} » ajoutée et confirmée dans le lexique Android.`);
+  }
+  if (name === 'plan_get_app_state') {
+    const state = stateFor();
+    const age = state.updated_at ? Date.now() - Date.parse(state.updated_at) : Infinity;
+    const online = age < 20000;
+    const out = { ...state, online };
+    return { content:[{type:'text',text: online ? `Application synchronisée : ${out.current_week_count||0} rue(s) cette semaine, ${out.today_count||0} aujourd'hui.` : "Aucun état Android récent : l'application n'est pas actuellement synchronisée."}], structuredContent:out };
   }
   if (name === 'plan_get_status') {
     const q = queueFor();
-    return { content: [{ type: 'text', text: `${q.length} commande(s) en attente pour Plan Travail Orsay.` }], structuredContent: { ok: true, pending_count: q.length, device_id: DEVICE_ID } };
+    const state = stateFor();
+    const age = state.updated_at ? Date.now() - Date.parse(state.updated_at) : Infinity;
+    const out = { ok:true, pending_count:q.length, device_id:DEVICE_ID, android_online:age<20000, last_android_sync:state.updated_at, current_week_count:state.current_week_count||0, today_count:state.today_count||0 };
+    return { content:[{type:'text',text:`${q.length} commande(s) en attente. Android ${out.android_online?'connecté':'non connecté'}. ${out.current_week_count} rue(s) confirmée(s) cette semaine.`}], structuredContent:out };
+  }
+  if (name === 'plan_get_lexicon') {
+    const state = stateFor();
+    const lexicon = Array.isArray(state.lexicon) ? state.lexicon : [];
+    return { content:[{type:'text',text:`${lexicon.length} entrée(s) de lexique synchronisée(s) depuis Android.`}], structuredContent:{device_id:DEVICE_ID,updated_at:state.updated_at,lexicon} };
   }
   if (name === 'plan_clear_pending') {
     queues.set(DEVICE_ID, []);
-    return { content: [{ type: 'text', text: 'Commandes Plan Travail Orsay supprimées.' }], structuredContent: { cleared: true } };
+    return { content:[{type:'text',text:'Commandes en attente supprimées.'}], structuredContent:{cleared:true} };
   }
   throw new Error(`Outil inconnu: ${name}`);
 }
 
-function handleRpc(body) {
-  const id = body && Object.prototype.hasOwnProperty.call(body, 'id') ? body.id : null;
+async function handleRpc(body) {
+  const id = body && Object.prototype.hasOwnProperty.call(body,'id') ? body.id : null;
   const method = body?.method;
-  if (method === 'initialize') {
-    return rpcResult(id, {
-      protocolVersion: '2025-06-18',
-      capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'Plan Travail Orsay', version: '1.0.0' }
-    });
-  }
-  if (method === 'ping') return rpcResult(id, {});
-  if (method === 'tools/list') return rpcResult(id, { tools: tools() });
+  if (method === 'initialize') return rpcResult(id,{protocolVersion:'2025-06-18',capabilities:{tools:{listChanged:false}},serverInfo:{name:'Plan Travail Orsay',version:'1.1.0'}});
+  if (method === 'ping') return rpcResult(id,{});
+  if (method === 'tools/list') return rpcResult(id,{tools:tools()});
   if (method === 'tools/call') {
-    try {
-      return rpcResult(id, executeTool(body?.params?.name, body?.params?.arguments || {}));
-    } catch (e) {
-      return rpcResult(id, { isError: true, content: [{ type: 'text', text: e.message || 'Erreur outil' }] });
-    }
+    try { return rpcResult(id, await executeTool(body?.params?.name, body?.params?.arguments||{})); }
+    catch(e) { return rpcResult(id,{isError:true,content:[{type:'text',text:e.message||'Erreur outil'}]}); }
   }
   if (method && method.startsWith('notifications/')) return null;
-  return rpcError(id, -32601, `Méthode non supportée: ${method || 'vide'}`);
+  return rpcError(id,-32601,`Méthode non supportée: ${method||'vide'}`);
 }
 
 export function installPlanTravailMcp(app) {
-  app.get('/plan-travail/health', (_req, res) => res.json({ ok: true, service: 'plan-travail-orsay-mcp' }));
+  app.get('/plan-travail/health', (_req,res)=>res.json({ok:true,service:'plan-travail-orsay-mcp',version:'1.1.0'}));
 
-  app.post('/plan-travail/mcp', (req, res) => {
-    const answer = handleRpc(req.body);
+  app.post('/plan-travail/mcp', async (req,res)=>{
+    const answer = await handleRpc(req.body);
     if (answer === null) return res.status(202).end();
-    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Cache-Control','no-store');
     return res.json(answer);
   });
 
-  app.get('/plan-travail/commands', (req, res) => {
-    const deviceId = String(req.query.device_id || DEVICE_ID);
+  app.get('/plan-travail/commands', (req,res)=>{
+    const deviceId = String(req.query.device_id||DEVICE_ID);
+    const now = Date.now();
     const q = queueFor(deviceId);
-    const commands = q.splice(0, q.length);
-    return res.json({ device_id: deviceId, commands });
+    const commands = q.filter(c => !c.delivered_at || now - Date.parse(c.delivered_at) > 10000);
+    for (const c of commands) c.delivered_at = new Date().toISOString();
+    return res.json({device_id:deviceId,commands});
   });
 
-  app.get('/plan-travail/status', (_req, res) => {
-    const q = queueFor();
-    return res.json({ ok: true, device_id: DEVICE_ID, pending_count: q.length });
+  app.post('/plan-travail/command-result', (req,res)=>{
+    const body = req.body || {};
+    const deviceId = String(body.device_id||DEVICE_ID);
+    const id = String(body.command_id||'');
+    if (!id) return res.status(400).json({ok:false,error:'command_id manquant'});
+    const result = { ...body, device_id:deviceId, received_at:new Date().toISOString() };
+    commandResults.set(id,result);
+    const q = queueFor(deviceId);
+    const idx = q.findIndex(c=>c.id===id);
+    if (idx >= 0) q.splice(idx,1);
+    return res.json({ok:true,command_id:id});
+  });
+
+  app.post('/plan-travail/device-state', (req,res)=>{
+    const body = req.body || {};
+    const deviceId = String(body.device_id||DEVICE_ID);
+    deviceStates.set(deviceId,{...body,device_id:deviceId,updated_at:new Date().toISOString()});
+    return res.json({ok:true,device_id:deviceId});
+  });
+
+  app.get('/plan-travail/status', (_req,res)=>{
+    const q=queueFor(); const state=stateFor();
+    const age=state.updated_at?Date.now()-Date.parse(state.updated_at):Infinity;
+    return res.json({ok:true,device_id:DEVICE_ID,pending_count:q.length,android_online:age<20000,last_android_sync:state.updated_at,current_week_count:state.current_week_count||0,today_count:state.today_count||0});
   });
 }
