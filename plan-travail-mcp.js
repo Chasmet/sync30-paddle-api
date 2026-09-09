@@ -40,8 +40,18 @@ function tools() {
     },
     {
       name: 'plan_add_lexicon',
-      description: "Ajoute une entrée au lexique de l'application et attend la confirmation Android.",
+      description: "Ajoute une entrée structurée au lexique de l'application et attend la confirmation Android.",
       inputSchema: { type:'object', properties:{ title:{type:'string'}, details:{type:'string'}}, required:['title','details'], additionalProperties:false }
+    },
+    {
+      name: 'plan_add_lexicon_note',
+      description: "Ajoute directement une note libre au lexique de l'application. À utiliser quand l'utilisateur dicte simplement une phrase à mémoriser.",
+      inputSchema: { type:'object', properties:{ text:{type:'string'}}, required:['text'], additionalProperties:false }
+    },
+    {
+      name: 'plan_reset_week',
+      description: "Remet à zéro tous les traçages et compteurs de la semaine en cours dans l'application. Le lexique est conservé. Attend la confirmation Android.",
+      inputSchema: { type:'object', properties:{}, additionalProperties:false }
     },
     {
       name: 'plan_get_app_state',
@@ -117,6 +127,14 @@ async function executeTool(name, args = {}) {
     if (!title || !details) throw new Error('Titre et détails obligatoires');
     return queuedWrite('add_lexicon', { title, details }, `Entrée « ${title} » ajoutée et confirmée dans le lexique Android.`);
   }
+  if (name === 'plan_add_lexicon_note') {
+    const text = String(args.text||'').trim();
+    if (!text) throw new Error('Texte du lexique manquant');
+    return queuedWrite('add_lexicon', { title:text, details:text }, `Note « ${text} » ajoutée et confirmée dans le lexique Android.`);
+  }
+  if (name === 'plan_reset_week') {
+    return queuedWrite('reset_week', {}, 'Remise à zéro de la semaine confirmée par l’application Android. Le lexique est conservé.');
+  }
   if (name === 'plan_get_app_state') {
     const state = stateFor();
     const age = state.updated_at ? Date.now() - Date.parse(state.updated_at) : Infinity;
@@ -146,7 +164,7 @@ async function executeTool(name, args = {}) {
 async function handleRpc(body) {
   const id = body && Object.prototype.hasOwnProperty.call(body,'id') ? body.id : null;
   const method = body?.method;
-  if (method === 'initialize') return rpcResult(id,{protocolVersion:'2025-06-18',capabilities:{tools:{listChanged:false}},serverInfo:{name:'Plan Travail Orsay',version:'1.1.0'}});
+  if (method === 'initialize') return rpcResult(id,{protocolVersion:'2025-06-18',capabilities:{tools:{listChanged:true}},serverInfo:{name:'Plan Travail Orsay',version:'1.2.0'}});
   if (method === 'ping') return rpcResult(id,{});
   if (method === 'tools/list') return rpcResult(id,{tools:tools()});
   if (method === 'tools/call') {
@@ -158,7 +176,7 @@ async function handleRpc(body) {
 }
 
 export function installPlanTravailMcp(app) {
-  app.get('/plan-travail/health', (_req,res)=>res.json({ok:true,service:'plan-travail-orsay-mcp',version:'1.1.0'}));
+  app.get('/plan-travail/health', (_req,res)=>res.json({ok:true,service:'plan-travail-orsay-mcp',version:'1.2.0'}));
 
   app.post('/plan-travail/mcp', async (req,res)=>{
     const answer = await handleRpc(req.body);
