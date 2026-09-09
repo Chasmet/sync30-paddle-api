@@ -1,10 +1,12 @@
 import express from "express";
 import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
+import { installPlanTravailMcp } from "./plan-travail-mcp.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+installPlanTravailMcp(app);
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
