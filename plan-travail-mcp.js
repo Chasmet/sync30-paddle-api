@@ -12,6 +12,13 @@ function rpcResult(id, result) { return { jsonrpc: '2.0', id, result }; }
 function rpcError(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function newId() { return `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
+function normalizeProgress(value) {
+  const n = Number(value || 100);
+  if (n <= 25) return 25;
+  if (n <= 50) return 50;
+  if (n <= 75) return 75;
+  return 100;
+}
 
 function stateFor(id = DEVICE_ID) {
   return deviceStates.get(id) || { device_id:id, online:false, updated_at:null, current_week_count:0, today_count:0, current_week_entries:[], today_streets:[], lexicon:[] };
@@ -22,15 +29,20 @@ function tools() {
   return [
     {
       name: 'plan_mark_streets',
-      description: "Marque une ou plusieurs rues d'Orsay. Compatibilité ancien connecteur : une valeur commençant par LEXIQUE: ajoute le texte suivant au lexique Android au lieu de marquer une rue." + finalRule,
-      inputSchema: { type:'object', properties:{ streets:{type:'array',items:{type:'string'},minItems:1}, date:{type:'string',description:'Date YYYY-MM-DD, aujourd’hui si absente.'}}, required:['streets'], additionalProperties:false }
+      description: "Marque une ou plusieurs rues d'Orsay. progress permet de tracer seulement 25 %, 50 %, 75 % ou 100 % de chaque rue. Sans progress, la rue est complète. Compatibilité ancien connecteur : une valeur commençant par LEXIQUE: ajoute le texte suivant au lexique Android." + finalRule,
+      inputSchema: { type:'object', properties:{ streets:{type:'array',items:{type:'string'},minItems:1}, date:{type:'string',description:'Date YYYY-MM-DD, aujourd’hui si absente.'}, progress:{type:'integer',enum:[25,50,75,100],description:'Avancement cumulé de la rue : 25, 50, 75 ou 100 %.'}}, required:['streets'], additionalProperties:false }
+    },
+    {
+      name:'plan_mark_street_progress',
+      description:"Règle précisément l'avancement cumulé d'une rue à 25 %, 50 %, 75 % ou 100 %. Android trace seulement la portion correspondante et conserve la couleur du jour pour la nouvelle portion."+finalRule,
+      inputSchema:{type:'object',properties:{street:{type:'string'},progress:{type:'integer',enum:[25,50,75,100]},date:{type:'string',description:'Date YYYY-MM-DD, aujourd’hui si absente.'}},required:['street','progress'],additionalProperties:false}
     },
     { name:'plan_delete_street', description:"Supprime le traçage d'une rue de la semaine en cours."+finalRule, inputSchema:{type:'object',properties:{street:{type:'string'}},required:['street'],additionalProperties:false} },
     { name:'plan_add_lexicon', description:"Ajoute une entrée structurée au lexique de l'application."+finalRule, inputSchema:{type:'object',properties:{title:{type:'string'},details:{type:'string'}},required:['title','details'],additionalProperties:false} },
     { name:'plan_add_lexicon_note', description:"Ajoute directement une note libre au lexique de l'application."+finalRule, inputSchema:{type:'object',properties:{text:{type:'string'}},required:['text'],additionalProperties:false} },
-    { name:'plan_virtual_keyboard', description:"Clavier virtuel interne de Plan Travail. target=lexicon ajoute le texte au lexique; target=street marque la rue saisie."+finalRule, inputSchema:{type:'object',properties:{target:{type:'string',enum:['lexicon','street']},text:{type:'string'},details:{type:'string'},date:{type:'string'}},required:['target','text'],additionalProperties:false} },
+    { name:'plan_virtual_keyboard', description:"Clavier virtuel interne de Plan Travail. target=lexicon ajoute le texte au lexique; target=street marque la rue saisie. progress accepte 25, 50, 75 ou 100 %."+finalRule, inputSchema:{type:'object',properties:{target:{type:'string',enum:['lexicon','street']},text:{type:'string'},details:{type:'string'},date:{type:'string'},progress:{type:'integer',enum:[25,50,75,100]}},required:['target','text'],additionalProperties:false} },
     { name:'plan_reset_week', description:"Remet à zéro les traçages de la semaine en cours sans supprimer le lexique."+finalRule, inputSchema:{type:'object',properties:{},additionalProperties:false} },
-    { name:'plan_get_app_state', description:"Lit l'état réellement renvoyé par Android, y compris le lexique.", inputSchema:{type:'object',properties:{},additionalProperties:false} },
+    { name:'plan_get_app_state', description:"Lit l'état réellement renvoyé par Android, y compris progress pour chaque rue et le lexique.", inputSchema:{type:'object',properties:{},additionalProperties:false} },
     { name:'plan_get_status', description:'Retourne les commandes en attente, la dernière synchronisation Android et les compteurs réellement confirmés.', inputSchema:{type:'object',properties:{},additionalProperties:false} },
     { name:'plan_get_lexicon', description:"Retourne le lexique réellement synchronisé depuis l'application Android.", inputSchema:{type:'object',properties:{},additionalProperties:false} },
     { name:'plan_clear_pending', description:'Supprime uniquement les commandes encore en attente.', inputSchema:{type:'object',properties:{},additionalProperties:false} }
@@ -84,15 +96,26 @@ async function queuedWrite(action, payload, successText, verify) {
   return { isError:false, content:[{type:'text',text:successText+' Résultat final relu et vérifié dans Android.'}], structuredContent:{queued:false,confirmed:true,final_verified:true,command_id:command.id,android_result:ack,app_state:state} };
 }
 
-function hasStreet(state, street, date) {
+function rowMatchesStreet(e, street) {
+  const a=String(e.street||'').trim().toLowerCase(), b=String(street||'').trim().toLowerCase();
+  return a===b || a.includes(b) || b.includes(a);
+}
+function hasStreet(state, street, date, progress) {
   const rows = Array.isArray(state.current_week_entries) ? state.current_week_entries : [];
-  return rows.some(e => String(e.street||'').trim().toLowerCase() === street.trim().toLowerCase() && (!date || String(e.date||e.work_date||'') === date));
+  return rows.some(e => rowMatchesStreet(e,street) && (!date || String(e.date||e.work_date||'') === date) && (!progress || Number(e.progress||100) >= Number(progress)));
+}
+function latestStreetProgress(state, street) {
+  const rows=(Array.isArray(state.current_week_entries)?state.current_week_entries:[]).filter(e=>rowMatchesStreet(e,street));
+  if(!rows.length)return 0;
+  rows.sort((a,b)=>String(a.date||'').localeCompare(String(b.date||'')));
+  return Number(rows[rows.length-1].progress||100);
 }
 function hasLexicon(state, text) {
   const rows = Array.isArray(state.lexicon) ? state.lexicon : [];
   const wanted = text.trim().toLowerCase();
   return rows.some(e => String(e.title||'').trim().toLowerCase() === wanted || String(e.details||'').toLowerCase().includes(wanted));
 }
+function todayIso(){return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Paris',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());}
 
 async function executeTool(name, args = {}) {
   if (name === 'plan_mark_streets') {
@@ -103,13 +126,19 @@ async function executeTool(name, args = {}) {
       if (!text) throw new Error('Texte lexique manquant après LEXIQUE:');
       return queuedWrite('add_lexicon', { title:text, details:text }, `Compatibilité MCP : « ${text} » ajouté dans le lexique Android.`, state=>hasLexicon(state,text));
     }
-    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date||'')) ? String(args.date) : new Date().toISOString().slice(0,10);
-    return queuedWrite('mark_streets', { streets, date }, `${streets.length} rue(s) appliquée(s) dans Plan Travail Orsay.`, state=>streets.every(s=>hasStreet(state,s,date)));
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date||'')) ? String(args.date) : todayIso();
+    const progress=normalizeProgress(args.progress||100);
+    return queuedWrite('mark_streets', { streets, date, progress }, `${streets.length} rue(s) appliquée(s) à ${progress} % dans Plan Travail Orsay.`, state=>streets.every(s=>hasStreet(state,s,date,progress)));
+  }
+  if(name==='plan_mark_street_progress'){
+    const street=String(args.street||'').trim();if(!street)throw new Error('Rue manquante');
+    const progress=normalizeProgress(args.progress);const date=/^\d{4}-\d{2}-\d{2}$/.test(String(args.date||''))?String(args.date):todayIso();
+    return queuedWrite('mark_street_progress',{street,progress,date},`${street} réglée à ${progress} % dans Android.`,state=>latestStreetProgress(state,street)>=progress);
   }
   if (name === 'plan_delete_street') {
     const street = String(args.street||'').trim();
     if (!street) throw new Error('Rue manquante');
-    return queuedWrite('delete_street', { street }, `Suppression de ${street} confirmée par Android.`, state=>!hasStreet(state,street,null));
+    return queuedWrite('delete_street', { street }, `Suppression de ${street} confirmée par Android.`, state=>!hasStreet(state,street,null,null));
   }
   if (name === 'plan_add_lexicon') {
     const title=String(args.title||'').trim(), details=String(args.details||'').trim();
@@ -123,18 +152,18 @@ async function executeTool(name, args = {}) {
   if (name === 'plan_virtual_keyboard') {
     const target=String(args.target||'').trim(), text=String(args.text||'').trim(); if(!text) throw new Error('Texte à saisir manquant');
     if(target==='lexicon') return queuedWrite('add_lexicon',{title:text,details:String(args.details||text).trim()||text},`Clavier MCP : « ${text} » écrit dans le lexique Android.`,state=>hasLexicon(state,text));
-    if(target==='street'){const date=/^\d{4}-\d{2}-\d{2}$/.test(String(args.date||''))?String(args.date):new Date().toISOString().slice(0,10);return queuedWrite('mark_streets',{streets:[text],date},`Clavier MCP : rue « ${text} » marquée dans Android.`,state=>hasStreet(state,text,date));}
+    if(target==='street'){const date=/^\d{4}-\d{2}-\d{2}$/.test(String(args.date||''))?String(args.date):todayIso();const progress=normalizeProgress(args.progress||100);return queuedWrite('mark_streets',{streets:[text],date,progress},`Clavier MCP : rue « ${text} » marquée à ${progress} % dans Android.`,state=>hasStreet(state,text,date,progress));}
     throw new Error('Destination clavier non supportée');
   }
   if (name === 'plan_reset_week') return queuedWrite('reset_week',{},'Remise à zéro de la semaine confirmée par Android. Le lexique est conservé.',state=>(state.current_week_count||0)===0);
   if (name === 'plan_get_app_state') {
     const state=stateFor(), age=state.updated_at?Date.now()-Date.parse(state.updated_at):Infinity, online=age<20000, out={...state,online};
-    return {content:[{type:'text',text:online?`Application synchronisée : ${out.current_week_count||0} rue(s) cette semaine, ${out.today_count||0} aujourd'hui.`:"Aucun état Android récent : l'application n'est pas actuellement synchronisée."}],structuredContent:out};
+    return {content:[{type:'text',text:online?`Application synchronisée : ${out.current_week_count||0} rue(s) commencée(s) cette semaine, ${out.today_count||0} aujourd'hui.`:"Aucun état Android récent : l'application n'est pas actuellement synchronisée."}],structuredContent:out};
   }
   if (name === 'plan_get_status') {
     const q=queueFor(), state=stateFor(), age=state.updated_at?Date.now()-Date.parse(state.updated_at):Infinity;
-    const out={ok:true,pending_count:q.length,device_id:DEVICE_ID,android_online:age<20000,last_android_sync:state.updated_at,current_week_count:state.current_week_count||0,today_count:state.today_count||0,lexicon_count:Array.isArray(state.lexicon)?state.lexicon.length:0};
-    return {content:[{type:'text',text:`${q.length} commande(s) en attente. Android ${out.android_online?'connecté':'non connecté'}. Lexique synchronisé : ${out.lexicon_count} entrée(s).`}],structuredContent:out};
+    const out={ok:true,pending_count:q.length,device_id:DEVICE_ID,android_online:age<20000,last_android_sync:state.updated_at,current_week_count:state.current_week_count||0,today_count:state.today_count||0,lexicon_count:Array.isArray(state.lexicon)?state.lexicon.length:0,partial_progress:true};
+    return {content:[{type:'text',text:`${q.length} commande(s) en attente. Android ${out.android_online?'connecté':'non connecté'}. Lexique synchronisé : ${out.lexicon_count} entrée(s). Progression partielle active.`}],structuredContent:out};
   }
   if (name === 'plan_get_lexicon') {
     const state=stateFor(), lexicon=Array.isArray(state.lexicon)?state.lexicon:[];
@@ -146,7 +175,7 @@ async function executeTool(name, args = {}) {
 
 async function handleRpc(body) {
   const id=body&&Object.prototype.hasOwnProperty.call(body,'id')?body.id:null, method=body?.method;
-  if(method==='initialize') return rpcResult(id,{protocolVersion:'2025-06-18',capabilities:{tools:{listChanged:true}},serverInfo:{name:'Plan Travail Orsay',version:'1.5.0'}});
+  if(method==='initialize') return rpcResult(id,{protocolVersion:'2025-06-18',capabilities:{tools:{listChanged:true}},serverInfo:{name:'Plan Travail Orsay',version:'1.6.0'}});
   if(method==='ping') return rpcResult(id,{});
   if(method==='tools/list') return rpcResult(id,{tools:tools()});
   if(method==='tools/call'){try{return rpcResult(id,await executeTool(body?.params?.name,body?.params?.arguments||{}));}catch(e){return rpcResult(id,{isError:true,content:[{type:'text',text:e.message||'Erreur outil'}]});}}
@@ -155,10 +184,10 @@ async function handleRpc(body) {
 }
 
 export function installPlanTravailMcp(app) {
-  app.get('/plan-travail/health',(_req,res)=>res.json({ok:true,service:'plan-travail-orsay-mcp',version:'1.5.0',legacy_lexicon_bridge:true,final_verification:true}));
+  app.get('/plan-travail/health',(_req,res)=>res.json({ok:true,service:'plan-travail-orsay-mcp',version:'1.6.0',legacy_lexicon_bridge:true,final_verification:true,partial_progress:true,progress_levels:[25,50,75,100]}));
   app.post('/plan-travail/mcp',async(req,res)=>{const answer=await handleRpc(req.body);if(answer===null)return res.status(202).end();res.setHeader('Cache-Control','no-store');return res.json(answer);});
   app.get('/plan-travail/commands',(req,res)=>{const deviceId=String(req.query.device_id||DEVICE_ID),now=Date.now(),q=queueFor(deviceId),commands=q.filter(c=>!c.delivered_at||now-Date.parse(c.delivered_at)>10000);for(const c of commands)c.delivered_at=new Date().toISOString();return res.json({device_id:deviceId,commands});});
   app.post('/plan-travail/command-result',(req,res)=>{const body=req.body||{},deviceId=String(body.device_id||DEVICE_ID),id=String(body.command_id||'');if(!id)return res.status(400).json({ok:false,error:'command_id manquant'});const result={...body,device_id:deviceId,received_at:new Date().toISOString()};commandResults.set(id,result);const q=queueFor(deviceId),idx=q.findIndex(c=>c.id===id);if(idx>=0)q.splice(idx,1);return res.json({ok:true,command_id:id});});
   app.post('/plan-travail/device-state',(req,res)=>{const body=req.body||{},deviceId=String(body.device_id||DEVICE_ID);deviceStates.set(deviceId,{...body,device_id:deviceId,updated_at:new Date().toISOString()});return res.json({ok:true,device_id:deviceId});});
-  app.get('/plan-travail/status',(_req,res)=>{const q=queueFor(),state=stateFor(),age=state.updated_at?Date.now()-Date.parse(state.updated_at):Infinity;return res.json({ok:true,device_id:DEVICE_ID,pending_count:q.length,android_online:age<20000,last_android_sync:state.updated_at,current_week_count:state.current_week_count||0,today_count:state.today_count||0,lexicon_count:Array.isArray(state.lexicon)?state.lexicon.length:0,legacy_lexicon_bridge:true,final_verification:true});});
+  app.get('/plan-travail/status',(_req,res)=>{const q=queueFor(),state=stateFor(),age=state.updated_at?Date.now()-Date.parse(state.updated_at):Infinity;return res.json({ok:true,device_id:DEVICE_ID,pending_count:q.length,android_online:age<20000,last_android_sync:state.updated_at,current_week_count:state.current_week_count||0,today_count:state.today_count||0,lexicon_count:Array.isArray(state.lexicon)?state.lexicon.length:0,legacy_lexicon_bridge:true,final_verification:true,partial_progress:true,progress_levels:[25,50,75,100]});});
 }
